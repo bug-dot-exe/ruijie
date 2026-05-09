@@ -98,6 +98,27 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(core._post_cloud_voucher(session, portal), (False, "SID123"))
         session.get.assert_not_called()
 
+    def test_auth_burst_falls_back_when_async_unavailable(self):
+        async def no_async_statuses(*_args, **_kwargs):
+            return []
+
+        session = mock.Mock()
+        portal = core.PortalSession(
+            session_url="https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123",
+            gateway_ip="192.168.110.1",
+            gateway_port="2060",
+            session_id="SID123",
+        )
+
+        with (
+            mock.patch.object(core, "AUTH_WORKERS", 2),
+            mock.patch.object(core, "_send_wifidog_auth_async", side_effect=no_async_statuses),
+            mock.patch.object(core, "_send_wifidog_auth", return_value=200) as send_auth,
+        ):
+            self.assertEqual(core._send_wifidog_auth_burst(session, portal, "SID123"), [200, 200])
+
+        self.assertEqual(send_auth.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ Use this only on networks you own, administer, or are explicitly allowed to test
 
 - Python 3.10 or newer
 - `requests`
+- `aiohttp`
 - Linux, Termux, or another POSIX-like shell
 
 Install dependencies:
@@ -48,6 +49,24 @@ python run.py
 
 If Termux asks for storage or network permissions, allow the normal network access required by Python. Root is not required.
 
+The default startup opens a small menu:
+
+```text
+[1] Setup / discover Ruijie session
+[2] Start internet auth monitor
+[3] Show cached session
+[4] Set voucher/access code
+[0] Exit
+```
+
+Run option `1` first while connected to the Ruijie Wi-Fi. Use option `4` if your access code is not the default `admin1`. Then run option `2`.
+
+For non-interactive startup:
+
+```bash
+RUIJIE_MENU=0 python run.py
+```
+
 ## Activation Key
 
 No activation key is needed in this version.
@@ -65,6 +84,7 @@ VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/?lang=en
 WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth")
 DEFAULT_ACCESS_CODE = os.environ.get("RUIJIE_ACCESS_CODE", "admin1")
 DEFAULT_PHONE_NUMBER = os.environ.get("RUIJIE_PHONE_NUMBER", "")
+AUTH_WORKERS = int(os.environ.get("RUIJIE_AUTH_WORKERS", "10"))
 ```
 
 Example:
@@ -75,7 +95,11 @@ RUIJIE_GATEWAY=192.168.1.1 RUIJIE_PORT=2060 python3 run.py
 
 If `RUIJIE_PHONE_NUMBER` is empty, the tool sends a random 16-character value like the old `star` build did.
 
+`RUIJIE_AUTH_WORKERS` controls the bounded concurrent WiFiDog auth retry burst. The default is `10`, matching the old `star` request pattern.
+
 Change these values if your Ruijie deployment uses different gateway IPs, ports, paths, or voucher parameters.
+
+This repo does not include voucher brute forcing or saved-code replay. Use option `4` or `RUIJIE_ACCESS_CODE=...` with a code you are allowed to use.
 
 ## Files Created
 
@@ -100,8 +124,9 @@ If the tool does not authenticate:
 - Open `http://192.168.0.1` or any HTTP site once in a browser if `.session_url` is not discovered.
 - If discovery still fails, run with `RUIJIE_SETUP_PROBE_URL=http://<your-router-ip> python run.py`.
 - Confirm your voucher/access code is correct. The default is `admin1`; override it with `RUIJIE_ACCESS_CODE=...`.
+- If Termux cannot install `aiohttp`, the tool falls back to normal `requests` auth attempts.
 - Try opening any HTTP site in a browser to trigger the portal redirect, then run the tool again.
-- On Termux, run `python -m pip install --upgrade pip requests urllib3` if dependencies fail.
+- On Termux, run `python -m pip install --upgrade pip requests urllib3 aiohttp` if dependencies fail.
 
 ## Test
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import email.utils
 import hashlib
 import hmac
+import asyncio
 import logging
 import os
 import platform
@@ -73,6 +74,11 @@ DEFAULT_USER_AGENT = os.environ.get(
     "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
 )
+try:
+    AUTH_WORKERS = max(1, int(os.environ.get("RUIJIE_AUTH_WORKERS", "10")))
+except ValueError:
+    AUTH_WORKERS = 10
+MENU_ENABLED = os.environ.get("RUIJIE_MENU", "1").lower() not in {"0", "false", "no", "off"}
 
 TIME_CHECK_FILE = Path.home() / ".turbo_runtime"
 SESSION_URL_FILE = Path(os.environ.get("RUIJIE_SESSION_FILE", ".session_url"))
@@ -98,6 +104,7 @@ GLOBAL_DID = ""
 GLOBAL_EXP_TS: int | None = None
 GLOBAL_STATUS = PENDING
 GLOBAL_ONLINE = False
+ACCESS_CODE = DEFAULT_ACCESS_CODE
 
 log_buffer: deque[str] = deque(maxlen=8)
 performance_history: deque[float] = deque(maxlen=25)
@@ -590,10 +597,10 @@ def _phone_number() -> str:
 
 
 def _post_cloud_voucher(session: Any, portal: PortalSession) -> tuple[bool, str]:
-    if not DEFAULT_ACCESS_CODE:
+    if not ACCESS_CODE:
         return False, portal.session_id
     payload = {
-        "accessCode": DEFAULT_ACCESS_CODE,
+        "accessCode": ACCESS_CODE,
         "sessionId": portal.session_id,
         "apiVersion": 1,
     }
@@ -635,6 +642,55 @@ def _send_wifidog_auth(session: Any, portal: PortalSession, token: str) -> int:
     except Exception:
         response = session.get(auth_url, params=params, headers=headers, timeout=5, allow_redirects=True, verify=False)
     return int(getattr(response, "status_code", 0) or 0)
+
+
+async def _send_wifidog_auth_async(portal: PortalSession, token: str, workers: int = AUTH_WORKERS) -> list[int]:
+    try:
+        import aiohttp
+    except ImportError:
+        return []
+
+    auth_url = _local_auth_url(portal)
+    headers = {
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    timeout = aiohttp.ClientTimeout(total=5)
+    connector = aiohttp.TCPConnector(limit=workers, ssl=False)
+
+    async def send_once(client: Any) -> int:
+        params = {
+            "token": token,
+            "phoneNumber": _phone_number(),
+        }
+        try:
+            async with client.post(auth_url, params=params, headers=headers) as response:
+                await response.text()
+                return int(response.status)
+        except Exception:
+            try:
+                async with client.get(auth_url, params=params, headers=headers, allow_redirects=True) as response:
+                    await response.text()
+                    return int(response.status)
+            except Exception:
+                return 0
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as client:
+        tasks = [asyncio.create_task(send_once(client)) for _ in range(workers)]
+        return await asyncio.gather(*tasks)
+
+
+def _send_wifidog_auth_burst(session: Any, portal: PortalSession, token: str) -> list[int]:
+    if AUTH_WORKERS <= 1:
+        return [_send_wifidog_auth(session, portal, token)]
+    try:
+        statuses = asyncio.run(_send_wifidog_auth_async(portal, token, AUTH_WORKERS))
+        if statuses:
+            return statuses
+    except Exception:
+        pass
+    return [_send_wifidog_auth(session, portal, token) for _ in range(AUTH_WORKERS)]
 
 
 def _check_online(session: Any) -> bool:
@@ -689,9 +745,10 @@ def start_process(max_cycles: int | None = None) -> None:
             else:
                 add_log("CLOUD VOUCHER DID NOT CONFIRM; TRYING WIFIDOG AUTH")
 
-            status_code = _send_wifidog_auth(session, portal, token)
+            status_codes = _send_wifidog_auth_burst(session, portal, token)
             GLOBAL_ONLINE = _check_online(session)
-            add_log(f"WIFIDOG HTTP {status_code} | ONLINE:{GLOBAL_ONLINE}")
+            code_preview = ",".join(str(code) for code in status_codes[:5])
+            add_log(f"WIFIDOG HTTP [{code_preview}] | ONLINE:{GLOBAL_ONLINE}")
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -712,6 +769,89 @@ def _start_background_threads() -> list[threading.Thread]:
     for thread in threads:
         thread.start()
     return threads
+
+
+def _print_menu_status() -> None:
+    cached = _load_cached_portal_session()
+    sys.stdout.write("\033[H\033[J")
+    print(C_CYAN + TEXT_LOGO + C_RESET)
+    print("───────────────────────────────────────────────────────────────")
+    print(f"{C_BOLD}DEVICE ID   :{C_RESET} {GLOBAL_DID or get_device_id()}")
+    print(f"{C_BOLD}STATUS      :{C_RESET} {GLOBAL_STATUS}")
+    if cached:
+        print(f"{C_BOLD}SESSION     :{C_RESET} {cached.session_id[:12]}...")
+        print(f"{C_BOLD}GATEWAY     :{C_RESET} {cached.gateway_ip}:{cached.gateway_port}")
+    else:
+        print(f"{C_BOLD}SESSION     :{C_RESET} not discovered")
+    print("───────────────────────────────────────────────────────────────")
+    print("[1] Setup / discover Ruijie session")
+    print("[2] Start internet auth monitor")
+    print("[3] Show cached session")
+    print("[4] Set voucher/access code")
+    print("[0] Exit")
+
+
+def _setup_once() -> PortalSession:
+    session = _session()
+    add_log("SETUP: DISCOVERING RUIJIE SESSION")
+    portal = _discover_portal_session(session)
+    if portal.session_id:
+        _save_portal_session(portal)
+        print(f"{C_GREEN}[+] Setup success{C_RESET}")
+        print(f"    sessionId : {portal.session_id}")
+        print(f"    gateway   : {portal.gateway_ip}:{portal.gateway_port}")
+        print(f"    saved     : {SESSION_URL_FILE}, {IP_FILE}")
+    else:
+        print(f"{C_YELLOW}[!] Session not found{C_RESET}")
+        print("    Connect to the Ruijie Wi-Fi, open any HTTP site once, then run setup again.")
+    return portal
+
+
+def _show_cached_session() -> None:
+    cached = _load_cached_portal_session()
+    if not cached:
+        print(f"{C_YELLOW}[!] No cached session found{C_RESET}")
+        return
+    print(f"{C_GREEN}[+] Cached session{C_RESET}")
+    print(f"    sessionId : {cached.session_id}")
+    print(f"    gateway   : {cached.gateway_ip}:{cached.gateway_port}")
+    print(f"    url       : {cached.session_url}")
+
+
+def _set_access_code() -> None:
+    global ACCESS_CODE
+
+    value = input("Voucher/access code: ").strip()
+    if not value:
+        print(f"{C_YELLOW}[!] Access code unchanged{C_RESET}")
+        return
+    ACCESS_CODE = value
+    print(f"{C_GREEN}[+] Access code updated for this run{C_RESET}")
+
+
+def menu_loop() -> None:
+    while not stop_event.is_set():
+        _print_menu_status()
+        choice = input("Select Option: ").strip()
+        if choice == "1":
+            _setup_once()
+            input("Press Enter to continue...")
+        elif choice == "2":
+            print("[+] Starting auth monitor. Press Ctrl+C to stop.")
+            _start_background_threads()
+            start_process()
+            return
+        elif choice == "3":
+            _show_cached_session()
+            input("Press Enter to continue...")
+        elif choice == "4":
+            _set_access_code()
+            input("Press Enter to continue...")
+        elif choice == "0":
+            return
+        else:
+            print(f"{C_YELLOW}[!] Invalid choice{C_RESET}")
+            time.sleep(1)
 
 
 def main() -> None:
@@ -738,8 +878,11 @@ def main() -> None:
         GLOBAL_STATUS = VERIFIED_LIFETIME
         GLOBAL_EXP_TS = None
         add_log("[✓] ACTIVATION REMOVED. STARTING PORTAL WORKER...")
-        _start_background_threads()
-        start_process()
+        if MENU_ENABLED:
+            menu_loop()
+        else:
+            _start_background_threads()
+            start_process()
     except KeyboardInterrupt:
         add_log("[!] SCRIPT TERMINATED.")
     finally:
