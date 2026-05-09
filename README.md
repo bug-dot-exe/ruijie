@@ -1,6 +1,6 @@
 # Ruijie Captive Portal Helper
 
-Ruijie is a pure-Python recreation of the `newlay1027/sha` terminal tool. It keeps the captive-portal workflow, device ID generation, terminal status screen, voucher request, and WiFiDog auth loop, but it does not require the old activation-key/approval repository.
+Ruijie is a pure-Python terminal tool. It keeps the captive-portal workflow, device ID generation, terminal status screen, voucher request, and WiFiDog auth loop.
 
 Use this only on networks you own, administer, or are explicitly allowed to test.
 
@@ -50,8 +50,6 @@ If Termux asks for storage or network permissions, allow the normal network acce
 ## Activation Key
 
 No activation key is needed in this version.
-
-The original compiled build used a local activation check and an external approval source. This fork removes that startup gate, so there is no `~/.turbo_license` file and no dependency on the old approval repository.
 
 ## Network Configuration
 
