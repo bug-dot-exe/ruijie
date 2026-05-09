@@ -27,6 +27,19 @@ class CoreTests(unittest.TestCase):
     def test_validate_rejects_short_key(self):
         self.assertEqual(core.validate_key("SHA-TESTDEVICE", "SHORT"), (False, core.INVALID_FORMAT, None))
 
+    def test_normalize_portal_url_falls_back_to_gateway(self):
+        self.assertEqual(core._normalize_portal_url(None), "http://192.168.60.1:2060/")
+
+    def test_normalize_portal_url_expands_relative_paths(self):
+        self.assertEqual(
+            core._normalize_portal_url("/login"),
+            "http://192.168.60.1:2060/login",
+        )
+
+    def test_extract_portal_url_from_meta_refresh(self):
+        response = mock.Mock(headers={}, text='<meta http-equiv="refresh" content="0; url=/portal/login">')
+        self.assertEqual(core._extract_portal_url(response), "/portal/login")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,18 +53,24 @@ No activation key is needed in this version.
 
 ## Network Configuration
 
-The default portal values are defined near the top of `core.py`:
+The default portal values are defined near the top of `core.py` and can also be changed with environment variables:
 
 ```python
-TURBO_STABLE_NODE = "192.168.60.1"
-DEFAULT_GW_PORT = "2060"
-VOUCHER_PATH = "/api/auth/voucher/"
-WIFIDOG_AUTH_PATH = "/wifidog/auth?token="
-DEFAULT_ACCESS_CODE = "admin1"
-DEFAULT_PHONE_PARAM = "&phonenumber=admin"
+TURBO_STABLE_NODE = os.environ.get("RUIJIE_GATEWAY", "192.168.60.1")
+DEFAULT_GW_PORT = os.environ.get("RUIJIE_PORT", "2060")
+VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/")
+WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth?token=")
+DEFAULT_ACCESS_CODE = os.environ.get("RUIJIE_ACCESS_CODE", "admin1")
+DEFAULT_PHONE_PARAM = os.environ.get("RUIJIE_PHONE_PARAM", "&phonenumber=admin")
 ```
 
-Change these constants if your Ruijie deployment uses different gateway IPs, ports, paths, or voucher parameters.
+Example:
+
+```bash
+RUIJIE_GATEWAY=192.168.1.1 RUIJIE_PORT=2060 python3 run.py
+```
+
+Change these values if your Ruijie deployment uses different gateway IPs, ports, paths, or voucher parameters.
 
 ## Files Created
 
@@ -82,6 +88,8 @@ If the tool does not authenticate:
 
 - Confirm you are connected to the captive-portal Wi-Fi network first.
 - Confirm the gateway IP and port match your network.
+- If the phone says "no internet", that is normal before login; the tool now falls back to the local gateway directly.
+- Find the gateway on Termux with `ip route | grep default`.
 - Confirm the voucher endpoint exists on your portal.
 - Try opening any HTTP site in a browser to trigger the portal redirect, then run the tool again.
 - On Termux, run `python -m pip install --upgrade pip requests urllib3` if dependencies fail.

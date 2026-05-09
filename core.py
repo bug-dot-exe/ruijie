@@ -55,14 +55,14 @@ TEXT_SHAMM_STR = """   .!!!!!:.                 .:!!!!!!!:.
       $$$$$  $$$UX :!! UW$$$$$$$$  4$$$$$* ^$$$* $$$$\\  $$$$$$$$$$$$  d$$R"
        "*$bd$$$$     "*$$$$$$$$$o+#\""""
 
-TURBO_STABLE_NODE = "192.168.60.1"
-DEFAULT_GW_PORT = "2060"
-CONNECTIVITY_URL = "http://connectivitycheck.gstatic.com/generate_204"
-GOOGLE_URL = "http://www.google.com"
-VOUCHER_PATH = "/api/auth/voucher/"
-WIFIDOG_AUTH_PATH = "/wifidog/auth?token="
-DEFAULT_ACCESS_CODE = "admin1"
-DEFAULT_PHONE_PARAM = "&phonenumber=admin"
+TURBO_STABLE_NODE = os.environ.get("RUIJIE_GATEWAY", "192.168.60.1")
+DEFAULT_GW_PORT = os.environ.get("RUIJIE_PORT", "2060")
+CONNECTIVITY_URL = os.environ.get("RUIJIE_CONNECTIVITY_URL", "http://connectivitycheck.gstatic.com/generate_204")
+GOOGLE_URL = os.environ.get("RUIJIE_TIME_URL", "http://www.google.com")
+VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/")
+WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth?token=")
+DEFAULT_ACCESS_CODE = os.environ.get("RUIJIE_ACCESS_CODE", "admin1")
+DEFAULT_PHONE_PARAM = os.environ.get("RUIJIE_PHONE_PARAM", "&phonenumber=admin")
 
 TIME_CHECK_FILE = Path.home() / ".turbo_runtime"
 
@@ -85,6 +85,7 @@ CRITICAL = "CRITICAL"
 GLOBAL_DID = ""
 GLOBAL_EXP_TS: int | None = None
 GLOBAL_STATUS = PENDING
+GLOBAL_ONLINE = False
 
 log_buffer: deque[str] = deque(maxlen=8)
 performance_history: deque[float] = deque(maxlen=25)
@@ -272,8 +273,8 @@ def _format_expiry(expire_ts: int | None) -> str:
 
 
 def render_screen() -> None:
-    eyes = EYE_OPEN if GLOBAL_STATUS.startswith("VERIFIED") else EYE_CLOSED
-    status_line = EYE_OPEN_STR if GLOBAL_STATUS.startswith("VERIFIED") else EYE_CLOSED_STR
+    eyes = EYE_OPEN if GLOBAL_ONLINE else EYE_CLOSED
+    status_line = EYE_OPEN_STR if GLOBAL_ONLINE else EYE_CLOSED_STR
     lines = [
         "\033[H\033[J",
         C_CYAN + TEXT_LOGO + C_RESET,
@@ -313,7 +314,7 @@ def expiry_monitor() -> None:
 
 
 def high_speed_ping() -> None:
-    global current_ping_interval, is_pinging
+    global current_ping_interval, is_pinging, GLOBAL_ONLINE
     if requests is None:
         add_log("requests unavailable; ping monitor disabled")
         return
@@ -323,11 +324,16 @@ def high_speed_ping() -> None:
         while not stop_event.is_set():
             started = time.perf_counter()
             try:
-                session.get(CONNECTIVITY_URL, timeout=2, allow_redirects=False)
-                performance_history.append(time.perf_counter() - started)
-                avg = statistics.mean(performance_history)
-                current_ping_interval = max(MIN_INTERVAL, min(MAX_INTERVAL, avg * 2))
+                response = session.get(CONNECTIVITY_URL, timeout=2, allow_redirects=False)
+                GLOBAL_ONLINE = response.status_code == 204
+                if GLOBAL_ONLINE:
+                    performance_history.append(time.perf_counter() - started)
+                    avg = statistics.mean(performance_history)
+                    current_ping_interval = max(MIN_INTERVAL, min(MAX_INTERVAL, avg * 2))
+                else:
+                    current_ping_interval = min(MAX_INTERVAL, current_ping_interval + 0.1)
             except Exception:
+                GLOBAL_ONLINE = False
                 current_ping_interval = min(MAX_INTERVAL, current_ping_interval + 0.1)
             time.sleep(current_ping_interval)
     finally:
@@ -347,10 +353,29 @@ def _extract_portal_url(response: Any) -> str | None:
     if location:
         return location
     text = getattr(response, "text", "") or ""
-    match = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", text)
+    match = re.search(r"(?:location\.href|window\.location)\s*=\s*['\"]([^'\"]+)['\"]", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"location\.replace\(\s*['\"]([^'\"]+)['\"]\s*\)", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"<meta[^>]+http-equiv=['\"]?refresh['\"]?[^>]+content=['\"][^;]+;\s*url=([^'\"]+)", text, re.I)
     if match:
         return match.group(1)
     return None
+
+
+def _default_portal_url() -> str:
+    return f"http://{TURBO_STABLE_NODE}:{DEFAULT_GW_PORT}/"
+
+
+def _normalize_portal_url(portal_url: str | None) -> str:
+    portal_url = (portal_url or "").strip()
+    if not portal_url:
+        return _default_portal_url()
+    if not portal_url.startswith(("http://", "https://")):
+        return urljoin(_default_portal_url(), portal_url)
+    return portal_url
 
 
 def _extract_session_id(text: str, parsed_query: dict[str, list[str]]) -> str:
@@ -380,6 +405,8 @@ def _auth_payload(parsed: Any, sid: str) -> dict[str, Any]:
 
 
 def start_process(max_cycles: int | None = None) -> None:
+    global GLOBAL_ONLINE
+
     if requests is None:
         raise RuntimeError("requests is required for portal authentication")
 
@@ -389,18 +416,24 @@ def start_process(max_cycles: int | None = None) -> None:
         cycles += 1
         try:
             add_log("[✦] INITIALIZING INSTANT BYPASS SEQUENCE...")
-            test_url = CONNECTIVITY_URL
-            r1 = session.get(test_url, timeout=5, allow_redirects=False)
-            if r1.status_code == 204:
-                add_log("[✓] INTERNET ACCESS ACTIVE. AI OPTIMIZER ENABLED!")
-                time.sleep(current_ping_interval)
-                if max_cycles and cycles >= max_cycles:
-                    return
-                continue
+            portal_url = None
+            try:
+                r1 = session.get(CONNECTIVITY_URL, timeout=5, allow_redirects=False)
+                if r1.status_code == 204:
+                    GLOBAL_ONLINE = True
+                    add_log("[✓] INTERNET ACCESS ACTIVE. AI OPTIMIZER ENABLED!")
+                    time.sleep(current_ping_interval)
+                    if max_cycles and cycles >= max_cycles:
+                        return
+                    continue
+                GLOBAL_ONLINE = False
+                add_log(f"CAPTIVE CHECK HTTP {r1.status_code}; TRYING PORTAL")
+                portal_url = _extract_portal_url(r1)
+            except Exception as exc:
+                GLOBAL_ONLINE = False
+                add_log(f"NO PUBLIC INTERNET YET; TRYING GATEWAY ({exc.__class__.__name__})")
 
-            portal_url = _extract_portal_url(r1) or GOOGLE_URL
-            if not portal_url.startswith(("http://", "https://")):
-                portal_url = urljoin(f"http://{TURBO_STABLE_NODE}:{DEFAULT_GW_PORT}/", portal_url)
+            portal_url = _normalize_portal_url(portal_url)
             parsed = urlparse(portal_url)
             portal_host = parsed.netloc or f"{TURBO_STABLE_NODE}:{DEFAULT_GW_PORT}"
             portal_base = f"{parsed.scheme or 'http'}://{portal_host}"
@@ -461,7 +494,7 @@ def main() -> None:
 
         GLOBAL_STATUS = VERIFIED_LIFETIME
         GLOBAL_EXP_TS = None
-        add_log("[✓] INTERNET ACCESS ACTIVE. AI OPTIMIZER ENABLED!")
+        add_log("[✓] ACTIVATION REMOVED. STARTING PORTAL WORKER...")
         _start_background_threads()
         start_process()
     except KeyboardInterrupt:
