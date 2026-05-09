@@ -68,7 +68,7 @@ class CoreTests(unittest.TestCase):
 
     def test_send_wifidog_auth_uses_star_params(self):
         session = mock.Mock()
-        session.post.return_value = mock.Mock(status_code=200)
+        session.get.return_value = mock.Mock(status_code=200)
         portal = core.PortalSession(
             session_url="https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123",
             gateway_ip="192.168.110.1",
@@ -79,9 +79,9 @@ class CoreTests(unittest.TestCase):
         with mock.patch.object(core, "DEFAULT_PHONE_NUMBER", "admin"):
             self.assertEqual(core._send_wifidog_auth(session, portal, "SID123"), 200)
 
-        session.post.assert_called_once()
-        self.assertEqual(session.post.call_args.args[0], "http://192.168.110.1:2060/wifidog/auth")
-        self.assertEqual(session.post.call_args.kwargs["params"], {"token": "SID123", "phoneNumber": "admin"})
+        session.get.assert_called_once()
+        self.assertEqual(session.get.call_args.args[0], "http://192.168.110.1:2060/wifidog/auth")
+        self.assertEqual(session.get.call_args.kwargs["params"], {"token": "SID123", "phonenumber": "admin"})
 
     def test_post_cloud_voucher_requires_logon_url_for_success(self):
         session = mock.Mock()
