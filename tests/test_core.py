@@ -40,6 +40,64 @@ class CoreTests(unittest.TestCase):
         response = mock.Mock(headers={}, text='<meta http-equiv="refresh" content="0; url=/portal/login">')
         self.assertEqual(core._extract_portal_url(response), "/portal/login")
 
+    def test_extract_portal_url_from_star_href_script(self):
+        response = mock.Mock(headers={}, text="<script>href='https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123'</script>")
+        self.assertEqual(
+            core._extract_portal_url(response),
+            "https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123",
+        )
+
+    def test_portal_session_from_star_url(self):
+        portal = core._portal_session_from_url(
+            "https://portal-as.ruijienetworks.com/api/auth/wifidog?"
+            "gw_address=192.168.110.1&gw_port=2060&ip=192.168.110.63&sessionId=SID123"
+        )
+
+        self.assertEqual(portal.gateway_ip, "192.168.110.1")
+        self.assertEqual(portal.gateway_port, "2060")
+        self.assertEqual(portal.session_id, "SID123")
+
+    def test_find_logon_url_from_json(self):
+        response = mock.Mock()
+        response.json.return_value = {"logonUrl": "http://192.168.110.1:2060/wifidog/auth?token=TOK"}
+
+        self.assertEqual(
+            core._find_logon_url(response),
+            "http://192.168.110.1:2060/wifidog/auth?token=TOK",
+        )
+
+    def test_send_wifidog_auth_uses_star_params(self):
+        session = mock.Mock()
+        session.post.return_value = mock.Mock(status_code=200)
+        portal = core.PortalSession(
+            session_url="https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123",
+            gateway_ip="192.168.110.1",
+            gateway_port="2060",
+            session_id="SID123",
+        )
+
+        with mock.patch.object(core, "DEFAULT_PHONE_NUMBER", "admin"):
+            self.assertEqual(core._send_wifidog_auth(session, portal, "SID123"), 200)
+
+        session.post.assert_called_once()
+        self.assertEqual(session.post.call_args.args[0], "http://192.168.110.1:2060/wifidog/auth")
+        self.assertEqual(session.post.call_args.kwargs["params"], {"token": "SID123", "phoneNumber": "admin"})
+
+    def test_post_cloud_voucher_requires_logon_url_for_success(self):
+        session = mock.Mock()
+        response = mock.Mock(status_code=200, text='{"status":"failed"}')
+        response.json.return_value = {"status": "failed"}
+        session.post.return_value = response
+        portal = core.PortalSession(
+            session_url="https://portal-as.ruijienetworks.com/api/auth/wifidog?sessionId=SID123",
+            gateway_ip="192.168.110.1",
+            gateway_port="2060",
+            session_id="SID123",
+        )
+
+        self.assertEqual(core._post_cloud_voucher(session, portal), (False, "SID123"))
+        session.get.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

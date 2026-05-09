@@ -3,17 +3,19 @@ from __future__ import annotations
 import email.utils
 import hashlib
 import hmac
-import json
 import logging
 import os
 import platform
+import random
 import re
 import statistics
+import string
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -59,12 +61,22 @@ TURBO_STABLE_NODE = os.environ.get("RUIJIE_GATEWAY", "192.168.60.1")
 DEFAULT_GW_PORT = os.environ.get("RUIJIE_PORT", "2060")
 CONNECTIVITY_URL = os.environ.get("RUIJIE_CONNECTIVITY_URL", "http://connectivitycheck.gstatic.com/generate_204")
 GOOGLE_URL = os.environ.get("RUIJIE_TIME_URL", "http://www.google.com")
-VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/")
-WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth?token=")
+RUIJIE_PORTAL_HOST = os.environ.get("RUIJIE_PORTAL_HOST", "portal-as.ruijienetworks.com")
+RUIJIE_CLOUD_BASE = os.environ.get("RUIJIE_CLOUD_BASE", f"https://{RUIJIE_PORTAL_HOST}")
+RUIJIE_SETUP_PROBE_URL = os.environ.get("RUIJIE_SETUP_PROBE_URL", "http://192.168.0.1")
+VOUCHER_PATH = os.environ.get("RUIJIE_VOUCHER_PATH", "/api/auth/voucher/?lang=en_US")
+WIFIDOG_AUTH_PATH = os.environ.get("RUIJIE_WIFIDOG_AUTH_PATH", "/wifidog/auth")
 DEFAULT_ACCESS_CODE = os.environ.get("RUIJIE_ACCESS_CODE", "admin1")
-DEFAULT_PHONE_PARAM = os.environ.get("RUIJIE_PHONE_PARAM", "&phonenumber=admin")
+DEFAULT_PHONE_NUMBER = os.environ.get("RUIJIE_PHONE_NUMBER", "")
+DEFAULT_USER_AGENT = os.environ.get(
+    "RUIJIE_USER_AGENT",
+    "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+)
 
 TIME_CHECK_FILE = Path.home() / ".turbo_runtime"
+SESSION_URL_FILE = Path(os.environ.get("RUIJIE_SESSION_FILE", ".session_url"))
+IP_FILE = Path(os.environ.get("RUIJIE_IP_FILE", ".ip"))
 
 MIN_INTERVAL = 0.1
 MAX_INTERVAL = 1.5
@@ -94,6 +106,14 @@ is_pinging = False
 ui_thread_running = False
 stop_event = threading.Event()
 print_lock = threading.Lock()
+
+
+@dataclass(slots=True)
+class PortalSession:
+    session_url: str
+    gateway_ip: str
+    gateway_port: str
+    session_id: str
 
 
 def add_log(msg: str) -> None:
@@ -362,6 +382,9 @@ def _extract_portal_url(response: Any) -> str | None:
     match = re.search(r"<meta[^>]+http-equiv=['\"]?refresh['\"]?[^>]+content=['\"][^;]+;\s*url=([^'\"]+)", text, re.I)
     if match:
         return match.group(1)
+    match = re.search(r"href=['\"]([^'\"]+)['\"]\s*</script>", text, re.I)
+    if match:
+        return match.group(1)
     return None
 
 
@@ -378,30 +401,247 @@ def _normalize_portal_url(portal_url: str | None) -> str:
     return portal_url
 
 
-def _extract_session_id(text: str, parsed_query: dict[str, list[str]]) -> str:
-    for key in ("sessionId", "sid", "token"):
-        value = parsed_query.get(key)
-        if value:
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_text(path: Path, value: str) -> None:
+    try:
+        path.write_text(value.strip(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _first_query_value(query: dict[str, list[str]], *keys: str) -> str:
+    for key in keys:
+        value = query.get(key)
+        if value and value[0]:
             return value[0]
+    return ""
+
+
+def _extract_gateway_ip(text: str, query: dict[str, list[str]]) -> str:
+    value = _first_query_value(query, "gw_address", "gw_addr", "gateway")
+    if value:
+        return value
+    match = re.search(r"(?:gw_address|gw_addr)=([^&'\"\\s]+)", text or "")
+    if match:
+        return match.group(1)
+    return TURBO_STABLE_NODE
+
+
+def _extract_gateway_port(query: dict[str, list[str]]) -> str:
+    return _first_query_value(query, "gw_port", "port") or DEFAULT_GW_PORT
+
+
+def _extract_session_id(text: str, parsed_query: dict[str, list[str]]) -> str:
+    value = _first_query_value(parsed_query, "sessionId", "sid", "token")
+    if value:
+        return value
     sid_match_new = re.search(r"(?:sessionId|sid|SID)\s*[:=]\s*([A-Za-z0-9._-]+)", text or "")
     if sid_match_new:
         return sid_match_new.group(1)
-    return AI_READY
+    sid_match_url = re.search(r"[?&](?:sessionId|sid|token)=([A-Za-z0-9._-]+)", text or "")
+    if sid_match_url:
+        return sid_match_url.group(1)
+    return ""
 
 
-def _auth_payload(parsed: Any, sid: str) -> dict[str, Any]:
+def _portal_session_from_url(session_url: str, body_text: str = "") -> PortalSession:
+    normalized = _normalize_portal_url(session_url)
+    parsed = urlparse(normalized)
     query = parse_qs(parsed.query)
-    gw_addr = query.get("gw_address", query.get("gw_addr", [TURBO_STABLE_NODE]))[0]
-    gw_port = query.get("gw_port", [DEFAULT_GW_PORT])[0]
+    combined = f"{normalized}\n{body_text or ''}"
+    return PortalSession(
+        session_url=normalized,
+        gateway_ip=_extract_gateway_ip(combined, query),
+        gateway_port=_extract_gateway_port(query),
+        session_id=_extract_session_id(combined, query),
+    )
+
+
+def _load_cached_portal_session() -> PortalSession | None:
+    session_url = _read_text(SESSION_URL_FILE)
+    if not session_url:
+        return None
+    portal = _portal_session_from_url(session_url)
+    cached_ip = _read_text(IP_FILE)
+    if cached_ip:
+        portal.gateway_ip = cached_ip
+    if portal.session_id:
+        return portal
+    return None
+
+
+def _save_portal_session(portal: PortalSession) -> None:
+    _write_text(SESSION_URL_FILE, portal.session_url)
+    _write_text(IP_FILE, portal.gateway_ip)
+
+
+def _portal_headers(session_url: str = "") -> dict[str, str]:
     return {
-        "accessCode": DEFAULT_ACCESS_CODE,
-        "apiVersion": "1.0",
-        "gw_address": gw_addr,
-        "gw_addr": gw_addr,
-        "gw_port": gw_port,
-        "sessionId": sid,
-        "sid": sid,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "referer": session_url or RUIJIE_CLOUD_BASE,
+        "user-agent": DEFAULT_USER_AGENT,
     }
+
+
+def _discover_portal_session(session: Any, portal_url: str | None = None) -> PortalSession:
+    cached = _load_cached_portal_session()
+    candidates = [
+        portal_url,
+        CONNECTIVITY_URL,
+        _default_portal_url(),
+        RUIJIE_SETUP_PROBE_URL,
+        RUIJIE_CLOUD_BASE,
+    ]
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        probe_url = _normalize_portal_url(candidate)
+        if probe_url in seen:
+            continue
+        seen.add(probe_url)
+        try:
+            response = session.get(
+                probe_url,
+                timeout=7,
+                allow_redirects=True,
+                headers=_portal_headers(probe_url),
+                verify=False,
+            )
+        except Exception as exc:
+            add_log(f"DISCOVERY MISS {probe_url}: {exc.__class__.__name__}")
+            continue
+
+        response_text = getattr(response, "text", "") or ""
+        response_url = str(getattr(response, "url", "") or probe_url)
+        for source_url in (response_url, _extract_portal_url(response), probe_url):
+            if not source_url:
+                continue
+            if not source_url.startswith(("http://", "https://")):
+                source_url = urljoin(response_url or probe_url, source_url)
+            portal = _portal_session_from_url(source_url, response_text)
+            if portal.session_id:
+                _save_portal_session(portal)
+                return portal
+
+    if cached is not None:
+        add_log("USING CACHED SESSION_URL/IP")
+        return cached
+
+    return _portal_session_from_url(portal_url or _default_portal_url())
+
+
+def _cloud_voucher_url() -> str:
+    if VOUCHER_PATH.startswith(("http://", "https://")):
+        return VOUCHER_PATH
+    return urljoin(RUIJIE_CLOUD_BASE, VOUCHER_PATH)
+
+
+def _local_auth_url(portal: PortalSession) -> str:
+    return f"http://{portal.gateway_ip}:{portal.gateway_port}{WIFIDOG_AUTH_PATH}"
+
+
+def _json_or_empty(response: Any) -> dict[str, Any]:
+    try:
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _find_logon_url(response: Any) -> str:
+    data = _json_or_empty(response)
+    for key in ("logonUrl", "logon_url", "url"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        for key in ("logonUrl", "logon_url", "url"):
+            value = nested.get(key)
+            if isinstance(value, str) and value:
+                return value
+    text = getattr(response, "text", "") or ""
+    match = re.search(r'"logonUrl"\s*:\s*"([^"]+)"', text)
+    if match:
+        return match.group(1).replace("\\/", "/")
+    return ""
+
+
+def _token_from_logon_url(logon_url: str, fallback: str) -> str:
+    if not logon_url:
+        return fallback
+    query = parse_qs(urlparse(logon_url).query)
+    return _first_query_value(query, "token", "sessionId", "sid") or fallback
+
+
+def _phone_number() -> str:
+    if DEFAULT_PHONE_NUMBER:
+        return DEFAULT_PHONE_NUMBER
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choice(alphabet) for _ in range(16))
+
+
+def _post_cloud_voucher(session: Any, portal: PortalSession) -> tuple[bool, str]:
+    if not DEFAULT_ACCESS_CODE:
+        return False, portal.session_id
+    payload = {
+        "accessCode": DEFAULT_ACCESS_CODE,
+        "sessionId": portal.session_id,
+        "apiVersion": 1,
+    }
+    headers = {
+        "authority": RUIJIE_PORTAL_HOST,
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": RUIJIE_CLOUD_BASE,
+        "referer": portal.session_url,
+        "user-agent": DEFAULT_USER_AGENT,
+    }
+    response = session.post(_cloud_voucher_url(), json=payload, headers=headers, timeout=7, verify=False)
+    logon_url = _find_logon_url(response)
+    if logon_url:
+        session.get(logon_url, timeout=7, allow_redirects=True, headers=_portal_headers(portal.session_url), verify=False)
+        return True, _token_from_logon_url(logon_url, portal.session_id)
+    text = (getattr(response, "text", "") or "").lower()
+    data = _json_or_empty(response)
+    status = str(data.get("status", "")).lower()
+    if status in {"failed", "expired", "error"} or any(marker in text for marker in ("failed", "expired", "error")):
+        return False, portal.session_id
+    return False, portal.session_id
+
+
+def _send_wifidog_auth(session: Any, portal: PortalSession, token: str) -> int:
+    headers = {
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    params = {
+        "token": token,
+        "phoneNumber": _phone_number(),
+    }
+    auth_url = _local_auth_url(portal)
+    try:
+        response = session.post(auth_url, params=params, headers=headers, timeout=5, verify=False)
+    except Exception:
+        response = session.get(auth_url, params=params, headers=headers, timeout=5, allow_redirects=True, verify=False)
+    return int(getattr(response, "status_code", 0) or 0)
+
+
+def _check_online(session: Any) -> bool:
+    try:
+        return session.get(CONNECTIVITY_URL, timeout=5, allow_redirects=False).status_code == 204
+    except Exception:
+        return False
 
 
 def start_process(max_cycles: int | None = None) -> None:
@@ -433,22 +673,25 @@ def start_process(max_cycles: int | None = None) -> None:
                 GLOBAL_ONLINE = False
                 add_log(f"NO PUBLIC INTERNET YET; TRYING GATEWAY ({exc.__class__.__name__})")
 
-            portal_url = _normalize_portal_url(portal_url)
-            parsed = urlparse(portal_url)
-            portal_host = parsed.netloc or f"{TURBO_STABLE_NODE}:{DEFAULT_GW_PORT}"
-            portal_base = f"{parsed.scheme or 'http'}://{portal_host}"
+            add_log("[✦] DISCOVERING RUIJIE SESSION...")
+            portal = _discover_portal_session(session, portal_url)
+            if not portal.session_id:
+                add_log("SESSION ID NOT FOUND; OPEN AN HTTP SITE THEN RETRY")
+                if max_cycles and cycles >= max_cycles:
+                    return
+                time.sleep(current_ping_interval)
+                continue
 
-            add_log("[✦] DISCOVERING PORTAL & SESSION...")
-            r2 = session.get(portal_url, timeout=5, allow_redirects=True)
-            sid = _extract_session_id(getattr(r2, "text", ""), parse_qs(parsed.query))
-            payload = _auth_payload(parsed, sid)
+            add_log(f"SESSION {portal.session_id[:8]}... GW:{portal.gateway_ip}:{portal.gateway_port}")
+            voucher_ok, token = _post_cloud_voucher(session, portal)
+            if voucher_ok:
+                add_log("CLOUD VOUCHER ACCEPTED; SENDING WIFIDOG AUTH")
+            else:
+                add_log("CLOUD VOUCHER DID NOT CONFIRM; TRYING WIFIDOG AUTH")
 
-            voucher_url = urljoin(portal_base, VOUCHER_PATH)
-            auth_link = urljoin(portal_base, WIFIDOG_AUTH_PATH + AI_READY)
-            headers = {"Content-Type": "application/json", "User-Agent": "SHA/1.0"}
-            session.post(voucher_url, data=json.dumps(payload), headers=headers, timeout=5, verify=False)
-            session.get(auth_link + DEFAULT_PHONE_PARAM, timeout=5, allow_redirects=True, verify=False)
-            add_log(f"{AI_READY} | SID:{sid}")
+            status_code = _send_wifidog_auth(session, portal, token)
+            GLOBAL_ONLINE = _check_online(session)
+            add_log(f"WIFIDOG HTTP {status_code} | ONLINE:{GLOBAL_ONLINE}")
         except KeyboardInterrupt:
             raise
         except Exception as exc:

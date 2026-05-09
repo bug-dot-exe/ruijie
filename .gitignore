@@ -13,3 +13,6 @@ env/
 
 .turbo_runtime
 .turbo_license
+.session_url
+.ip
+success.txt
