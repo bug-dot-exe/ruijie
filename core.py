@@ -1019,6 +1019,22 @@ def main(argv: list[str] | None = None) -> None:
             pass
 
     args = _build_arg_parser().parse_args(argv)
+    
+    # Inline prompt logic for no-flag usage
+    if len(sys.argv) == 1 and MENU_ENABLED:
+        print(C_CYAN + TEXT_LOGO + C_RESET)
+        print(" [1] Start Instant Bypass (Auto-Setup + Monitor)")
+        print(" [2] Manual Menu")
+        print(" [0] Exit")
+        prompt_choice = input("\n Select Option: ").strip()
+        if prompt_choice == "1":
+            args.setup = True
+            args.force = True
+        elif prompt_choice == "2":
+            pass # Continue to menu_loop
+        else:
+            return
+
     if args.code:
         ACCESS_CODE = args.code
     if args.workers is not None:
