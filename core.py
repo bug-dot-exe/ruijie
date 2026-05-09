@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
 import email.utils
 import hashlib
 import hmac
-import asyncio
 import logging
 import os
 import platform
@@ -854,8 +855,22 @@ def menu_loop() -> None:
             time.sleep(1)
 
 
-def main() -> None:
-    global GLOBAL_DID, GLOBAL_EXP_TS, GLOBAL_STATUS
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ruijie",
+        description="Ruijie captive portal helper",
+    )
+    parser.add_argument("-s", "--setup", action="store_true", help="discover and save the Ruijie session, then exit unless -f is also used")
+    parser.add_argument("-f", "--force", action="store_true", help="start the auth monitor without opening the menu")
+    parser.add_argument("-c", "--code", metavar="CODE", help="voucher/access code to use for this run")
+    parser.add_argument("-w", "--workers", type=int, metavar="N", help="number of concurrent WiFiDog auth attempts")
+    parser.add_argument("--show-session", action="store_true", help="show cached .session_url/.ip data, then exit unless -f is also used")
+    parser.add_argument("--no-menu", action="store_true", help="disable the interactive menu")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    global ACCESS_CODE, AUTH_WORKERS, GLOBAL_DID, GLOBAL_EXP_TS, GLOBAL_STATUS
 
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
     if requests is not None:
@@ -864,8 +879,16 @@ def main() -> None:
         except Exception:
             pass
 
-    sys.stdout.write("\033[?1049h\033[?25l")
-    sys.stdout.flush()
+    args = _build_arg_parser().parse_args(argv)
+    if args.code:
+        ACCESS_CODE = args.code
+    if args.workers is not None:
+        AUTH_WORKERS = max(1, args.workers)
+
+    use_alt_screen = not ((args.setup or args.show_session) and not args.force)
+    if use_alt_screen:
+        sys.stdout.write("\033[?1049h\033[?25l")
+        sys.stdout.flush()
     try:
         GLOBAL_DID = get_device_id()
         add_log("[✦] DISCOVERING PORTAL & SESSION...")
@@ -878,17 +901,29 @@ def main() -> None:
         GLOBAL_STATUS = VERIFIED_LIFETIME
         GLOBAL_EXP_TS = None
         add_log("[✓] ACTIVATION REMOVED. STARTING PORTAL WORKER...")
-        if MENU_ENABLED:
-            menu_loop()
-        else:
+
+        if args.setup:
+            _setup_once()
+            if not args.force:
+                return
+
+        if args.show_session:
+            _show_cached_session()
+            if not args.force:
+                return
+
+        if args.force or args.no_menu or not MENU_ENABLED:
             _start_background_threads()
             start_process()
+        else:
+            menu_loop()
     except KeyboardInterrupt:
         add_log("[!] SCRIPT TERMINATED.")
     finally:
         stop_event.set()
-        sys.stdout.write("\033[?1049l\033[?25h")
-        sys.stdout.flush()
+        if use_alt_screen:
+            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":

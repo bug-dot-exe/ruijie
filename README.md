@@ -61,6 +61,25 @@ The default startup opens a small menu:
 
 Run option `1` first while connected to the Ruijie Wi-Fi. Use option `4` if your access code is not the default `admin1`. Then run option `2`.
 
+You can also run the same flow with flags:
+
+```bash
+python run.py -s
+python run.py -f -c YOUR_ACCESS_CODE
+python run.py -s -f -c YOUR_ACCESS_CODE
+```
+
+Flags:
+
+```text
+-s, --setup          discover and save .session_url/.ip
+-f, --force          start auth monitor without the menu
+-c, --code CODE      voucher/access code for this run
+-w, --workers N      concurrent WiFiDog auth attempts
+--show-session       print cached .session_url/.ip
+--no-menu            disable the interactive menu
+```
+
 For non-interactive startup:
 
 ```bash

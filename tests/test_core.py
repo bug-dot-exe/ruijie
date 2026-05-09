@@ -119,6 +119,14 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(send_auth.call_count, 2)
 
+    def test_cli_flags_parse_setup_force_code(self):
+        args = core._build_arg_parser().parse_args(["-s", "-f", "-c", "CODE123", "-w", "3"])
+
+        self.assertTrue(args.setup)
+        self.assertTrue(args.force)
+        self.assertEqual(args.code, "CODE123")
+        self.assertEqual(args.workers, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
